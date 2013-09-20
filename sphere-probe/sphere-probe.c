@@ -4,7 +4,7 @@
 
 /*
 **
-** detector-probe utility, originally based on NSS tstclnt code.
+** sphere-probe utility, originally based on NSS tstclnt code.
 **
 */
 
