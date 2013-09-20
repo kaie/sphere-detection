@@ -22,7 +22,7 @@ If necessary, edit file sphere_control.config to adjust the tor_path setting.
 Run
 ===
 $ source env.sh
-$ python -c "import sphere_control; controller = sphere_control.start()"
+$ python -c "import sphere_control; controller, proc = sphere_control.start()"
 Be patient. The previous command will take a while when you first execute it,
 while we bootstrap 5 separate Tor connections. You may use the following
 command to watch the progress. You should wait until all spheres have reported
