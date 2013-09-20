@@ -25,7 +25,7 @@ def start_tor(tor_path, socks_port, control_port, data_dir, countries):
 	'DataDirectory': data_dir,
 	'Log': log_setting,
     }
-    stem.process.launch_tor_with_config(config = tor_config, tor_cmd = tor_path, completion_percent=80)
+    return stem.process.launch_tor_with_config(config = tor_config, tor_cmd = tor_path, completion_percent=80)
 
 def stop_tor(control_port):
     tor_pid = stem.util.system.get_pid_by_port(control_port)
@@ -52,6 +52,7 @@ def start(base_port = DEFAULT_BASE_PORT):
     ensure_dir("tor_data_dir")
     countries_list = []
     controller = []
+    proc = []
     for i in range(0,5):
 	countries_list.append([])
 	sphere = str(i+1)
@@ -82,12 +83,16 @@ def start(base_port = DEFAULT_BASE_PORT):
 	    print "invalid empty countries list in " + sphere_name
 	    exit()
 	print "%s has countries %s" % (sphere_name, countries_string)
-	start_tor(tor_path, socks_port, control_port, data_dir, countries_string)
+	proc.append(start_tor(tor_path, socks_port, control_port, data_dir, countries_string))
 	controller.append(stem.control.Controller.from_port(port = control_port))
 	controller[i].authenticate()
+    killcmd = "kill"
+    for p in proc:
+	killcmd = killcmd + " " + str(p.pid)
     print "Tor spheres have been started... To stop the spheres, use:"
-    print "  sphere_control.stop()"
-    return controller
+    #print "  sphere_control.stop()"
+    print "  " + killcmd
+    return (controller, proc)
     #caller can use e.g.: controller[4].signal(stem.Signal.NEWNYM)
 
 def stop(base_port = DEFAULT_BASE_PORT):
