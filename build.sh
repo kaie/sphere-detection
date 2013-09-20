@@ -1,6 +1,6 @@
 #!/bin/bash
 if [ `uname -m` = "x86_64" ]; then
-  USE_64=1
+  export USE_64=1
 fi
 
 cd sphere-probe
