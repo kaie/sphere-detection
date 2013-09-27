@@ -24,6 +24,7 @@ def start_tor(tor_path, socks_port, control_port, data_dir, countries):
 	'AvoidDiskWrites': str(1),
 	'DataDirectory': data_dir,
 	'Log': log_setting,
+	'DisableDebuggerAttachment': str(0),
     }
     return stem.process.launch_tor_with_config(config = tor_config, tor_cmd = tor_path, completion_percent=80)
 
@@ -90,8 +91,8 @@ def start(base_port = DEFAULT_BASE_PORT):
     for p in proc:
 	killcmd = killcmd + " " + str(p.pid)
     print "Tor spheres have been started... To stop the spheres, use:"
-    #print "  sphere_control.stop()"
-    print "  " + killcmd
+    print "  sphere_control.stop() # from within python"
+    print "  " + killcmd + " # from a terminal"
     return (controller, proc)
     #caller can use e.g.: controller[4].signal(stem.Signal.NEWNYM)
 
