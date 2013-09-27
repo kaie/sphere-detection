@@ -10,6 +10,7 @@
 
 #include "secutil.h"
 #include "basicutil.h"
+#include "iniparser.h"
 
 #if defined(XP_UNIX)
 #include <unistd.h>
@@ -39,6 +40,131 @@
 #include <fcntl.h>
 #include <io.h>
 #endif
+
+
+/*
+ * -C config.ini
+ *    multiple hostnames to probe repeatedly
+ *    A minimal valid file looks like:
+ *        [any-section-name]
+ *        host = www.example.com
+ *        port = 443
+ *        certs = 1
+ *        cert1 = expected-cert-for-host.example.com-der.or.pem)
+ *    file may contain one or multiple sections
+ *    each section indicates one service to probe.
+ *    Each service will be probed at a random interval, between 1 minutes and 20 minutes
+ *    each section starts withs a section name. Any name is OK, but must be unique in the file.
+ *      [any-section-name]
+ *    each section contains mandatory entries
+ *      host = the hostname to connect to
+ *      port = the port number of the SSL/TLS service to probe
+ *      certs = number-of-comparison-certs
+ *    number-of-comparison-certs must be 1 or larger
+ *    There must be one or multiple entries that list the filenames
+ *    that contain valid comparison certs (that will not be alerted if found)
+ *    Each filename must be in binary DER format, raw binary comparison will be used.
+ *      cert1 = first comparison cert filename
+ *      cert2 = ...
+ *      ...
+ *    Each time a mismatch is found (a certificate received from a server doesn't
+ *    match any of the comparison certs), then a report will be created and logged to disk.
+ *    If an alert-script.sh has been configured, it will be executed and the report
+ *    will be passed to the alert script as the first parameter.
+ *     
+ * -A alert-script.sh
+ *    run with: system("alert-script.sh temp-file")
+ *    temp-file is a text report of the mismatch, containing full certificates
+ *    temp-file will be created by probe tool, and deleted after alert-script is done
+ *    This script will also be called, if at least one local Tor spheres cannot be reached,
+ *    and the report will contain TOR-SPHERE-OFFLINE
+ * 
+ * -R
+ *    Remote Tor spheres, only.
+ *    No direct connection using the local network will be performed.
+ *    This could be used to hide which servers are being probed from a nearby
+ *    adversary.
+ * 
+ * -W
+ *    Using the -W you can SUPPRESS (disable) the daily success report.
+ *    If this parameter hasn't been given, the behaviour is as follows:
+ *    Usually, if no mismatches have been detected, the alert-script will be called
+ *    once a day for testing purposes. The first line of such a test report will contain
+ *    only one line with: ALL-IS-WELL
+ *    This can be used to monitor that the alert-script works correctly.
+ *    After startup of the program, all hosts will be tested, and if no problems were 
+ *    found, the first ALL-RIGHT report will be generated immediately.
+ *    The next report will be generated approximately after 24 hours.
+ */
+
+typedef struct config_entry_str {
+    const char *host;
+    PRUint16 portno;
+    CERTCertList *allowed_certs;
+    struct config_entry_str *next;
+} config_entry;
+
+PLArenaPool *config_arena = NULL;
+config_entry *root_config_entry;
+
+CERTCertificate *
+LoadCertFromFile(const char *filename, PRBool ascii)
+{
+    CERTCertificate *cert;
+    SECStatus rv;
+    SECItem item = {0, NULL, 0};
+    PRFileDesc* fd = PR_Open(filename, PR_RDONLY, 0777); 
+    if (!fd) {
+        return NULL;
+    }
+    rv = SECU_ReadDERFromFile(&item, fd, ascii, PR_FALSE);
+    PR_Close(fd);
+    if (rv != SECSuccess || !item.len) {
+        PORT_Free(item.data);
+        return NULL;
+    }
+    cert = CERT_NewTempCertificate(CERT_GetDefaultCertDB(), &item, 
+				   NULL     /* nickname */, 
+				   PR_FALSE /* isPerm */, 
+				   PR_TRUE  /* copyDER */);
+    PORT_Free(item.data);
+    return cert;
+}
+
+CERTCertificate *
+AppendNewCertEntry(CERTCertList *list, const char *filename)
+{
+    /*try ascii*/
+    CERTCertificate *c = LoadCertFromFile(filename, PR_TRUE);
+    if (!c) {
+	/*try binary*/
+	c = LoadCertFromFile(filename, PR_FALSE);
+	if (!c)
+	    return NULL;
+    }
+    CERT_AddCertToListTail(list, c);
+    return c;
+}
+
+config_entry *
+AppendNewConfigEntry(config_entry *root, const char *host, PRUint16 portno)
+{
+    config_entry *last;
+    
+    config_entry *ce = PORT_ArenaZNew(config_arena, config_entry);
+    ce->host = PORT_ArenaStrdup(config_arena, host);
+    ce->portno = portno;
+    ce->allowed_certs = CERT_NewCertList();
+
+    last = root;
+    while (last && last->next) {
+	last = last->next;
+    }
+    if (last) {
+	last->next = ce;
+    }
+    return ce;
+}
 
 #define PRINTF  if (verbose)  printf
 #define FPRINTF if (verbose) fprintf
@@ -97,6 +223,25 @@ unsigned long __cmp_umuls;
 PRBool verbose;
 int multiplier = 0;
 PRBool clientSpeaksFirst = PR_FALSE;
+char *cipherString = NULL;
+SSLVersionRange    enabledVersions;
+PRBool             enableSSL2 = PR_FALSE;
+int                disableLocking = 0;
+int                enableSessionTickets = 0;
+int                enableCompression = 0;
+int                enableFalseStart = 0;
+int                enableCertStatus = 0;
+PRBool oneShotMode = PR_FALSE;
+PRBool configMode = PR_FALSE;
+PRUint16 detectorPorts[numDetectors];
+PRFileDesc *detectorSockets[numDetectors];
+PRIntervalTime detectorTimeout;
+
+const char *config_filename = NULL;
+const char *dump_filename = NULL;
+const char *alert_script_filename = NULL;
+PRBool allow_direct_probe = PR_TRUE;
+PRBool suppress_all_is_well = PR_FALSE;
 
 static char *progName;
 
@@ -189,7 +334,7 @@ myPrintShortCertID(FILE *out, const SECItem *der, const char *m, int level)
     SECU_Indent(out, level); fprintf(out, "%s:\n", m);
     SECU_PrintName(out, &c->subject, "Subject", level+1); fprintf(out, "\n");
     SECU_PrintName(out, &c->issuer, " Issuer", level+1); fprintf(out, "\n");
-    SECU_PrintInteger(out, &c->serialNumber, " Serial Number", level+1);
+    SECU_PrintInteger(out, &c->serialNumber, " Serial", level+1);
     SECU_Indent(out, level+1);  fprintf(out, "Validity:\n");
     SECU_PrintTimeChoice(out, &c->validity.notBefore, "Not Before", level+2);
     SECU_PrintTimeChoice(out, &c->validity.notAfter,  "Not After ", level+2);
@@ -203,17 +348,24 @@ loser:
 static void PrintUsageHeader(const char *progName)
 {
     fprintf(stderr, 
-"Usage:  %s -h host [-p port]\n"
+"Usage:  %s -h host [-p port] [-C config] [-R] [-A script] [-W]\n"
                     "[-fsv] [-c ciphers] [-Y]\n"
                     "[-V [min-version]:[max-version]] [-T]\n"
-                    "[-q [-t seconds]]\n", 
-            progName);
+            , progName);
 }
 
 static void PrintParameterUsage(void)
 {
+    fprintf(stderr, "One-shot mode (probe one host, then exit):\n");
     fprintf(stderr, "%-20s Hostname to connect with\n", "-h host");
     fprintf(stderr, "%-20s Port number for SSL server\n", "-p port");
+    fprintf(stderr, "%-20s Dump retrieved certificates to file\n", "-D dump-file");
+    fprintf(stderr, "Monitoring mode (repeatedly test, wait, test...):\n");
+    fprintf(stderr, "%-20s Config file for probing hosts\n", "-C config");
+    fprintf(stderr, "%-20s Remote probing, only (no direct connection)\n", "-R");
+    fprintf(stderr, "%-20s Alert script that will be called on failures\n", "-A script");
+    fprintf(stderr, "%-20s Suppress the daily ALL-IS-WELL report\n", "-W");
+    fprintf(stderr, "Common options:\n");
     fprintf(stderr, 
             "%-20s Restricts the set of enabled SSL/TLS protocols versions.\n"
             "%-20s SSL 3 and newer versions are enabled by default.\n"
@@ -223,8 +375,6 @@ static void PrintParameterUsage(void)
     fprintf(stderr, "%-20s Client speaks first. \n", "-f");
     fprintf(stderr, "%-20s Disable SSL socket locking.\n", "-s");
     fprintf(stderr, "%-20s Verbose progress reporting.\n", "-v");
-    fprintf(stderr, "%-20s Ping the server and then exit.\n", "-q");
-    fprintf(stderr, "%-20s Timeout for server ping (default: no timeout).\n", "-t seconds");
     fprintf(stderr, "%-20s Enable the session ticket extension.\n", "-u");
     fprintf(stderr, "%-20s Enable compression.\n", "-z");
     fprintf(stderr, "%-20s Enable false start.\n", "-g");
@@ -237,6 +387,13 @@ static void Usage(const char *progName)
 {
     PrintUsageHeader(progName);
     PrintParameterUsage();
+    exit(1);
+}
+
+static void UsageIni(const char *progName)
+{
+    PrintUsageHeader(progName);
+    fprintf(stderr, "error in config file\n");
     exit(1);
 }
 
@@ -314,11 +471,11 @@ typedef struct
 {
    void * dbHandle;    /* Certificate database handle to use while
                         * authenticating the peer's certificate. */
-   PRBool requireDataForIntermediates;
    CERTCertificate *detectorCerts[numDetectors];
+   CERTCertificate *directCert;
 } ServerCertAuth;
 
-
+ServerCertAuth     serverCertAuth;
 
 
 static SECStatus 
@@ -345,6 +502,7 @@ ownAuthCertificate(void *arg, PRFileDesc *fd, PRBool checkSig,
     if (!cert) {
 	exit(254);
     }
+    serverCertAuth->directCert = CERT_DupCertificate(cert);
 
     {
 	int i;
@@ -356,19 +514,19 @@ ownAuthCertificate(void *arg, PRFileDesc *fd, PRBool checkSig,
 		++matches;
 	    }
 	}
-	fprintf(stderr, "Server's certificate matches with %d detectors\n", matches);
+#if 0
 	SECU_PrintSignedContent(stdout, &cert->derCert,
 			    "Certificate", 0, (SECU_PPFunc)myPrintShortCertID);
+#endif
+	fprintf(stdout, "The direct connection server certificate matches with %d detectors\n", matches);
 	if (matches < requiredDetectorMatches) {
-	    fprintf(stderr, "FAILURE\n");
-	    CERT_DestroyCertificate(cert);
+	    fprintf(stdout, "FAILURE\n");
 	    PORT_SetError(SEC_ERROR_CERT_NOT_VALID);
 	    return SECFailure;
 	}
     }
 
-    fprintf(stderr, "SUCCESS\n");
-    CERT_DestroyCertificate(cert);
+    fprintf(stdout, "SUCCESS\n");
     PORT_SetError(SEC_ERROR_CERT_VALID);
     return SECFailure;
 }
@@ -382,7 +540,7 @@ printHostNameAndAddr(const char * host, const PRNetAddr * addr)
 
     if (st == PR_SUCCESS) {
 	port = PR_ntohs(port);
-	FPRINTF(stderr, "%s: connecting to %s:%hu (address=%s)\n",
+	FPRINTF(stdout, "%s: connecting to %s:%hu (address=%s)\n",
 	       progName, host, port, addrBuf);
     }
 }
@@ -417,6 +575,9 @@ SOCKS5Socket_AddTo(int32_t family,
 		   int32_t proxyPort,
 		   PRFileDesc *sock);
 
+/* TODO: implement timeout */
+/* TODO: retry on EOF  */
+/* TODO: implement TOR-SPHERE-OFFLINE with separate error code */
 static int
 queryDetectors(PRFileDesc *model, const char *host, PRUint16 portno,
 		 PRUint16 *ports, PRFileDesc **sockets, CERTCertificate **detectorCerts,
@@ -652,206 +813,55 @@ queryDetectors(PRFileDesc *model, const char *host, PRUint16 portno,
     return count_success;
 }
 
-int main(int argc, char **argv)
+int
+probeOne(const char *host, PRUint16 portno)
 {
-    PRFileDesc *       s;
-    char *             host	=  NULL;
-    char *             cipherString = NULL;
-    char *             tmp;
-    SECStatus          rv;
     PRStatus           status;
-    PRInt32            filesReady;
-    SSLVersionRange    enabledVersions;
-    PRBool             enableSSL2 = PR_FALSE;
-    int                disableLocking = 0;
-    int                enableSessionTickets = 0;
-    int                enableCompression = 0;
-    int                enableFalseStart = 0;
-    int                enableCertStatus = 0;
-    PRSocketOptionData opt;
     PRNetAddr          addr;
-    PRPollDesc         pollset[2];
-    PRBool             pingServerFirst = PR_FALSE;
-    int                pingTimeoutSeconds = -1;
-    ServerCertAuth     serverCertAuth;
-    int                error = 0;
-    PRUint16           portno = 443;
-    PLOptState *optstate;
-    PLOptStatus optstatus;
-    PRStatus prStatus;
-    PRUint16 detectorPorts[numDetectors];
-    PRFileDesc *detectorSockets[numDetectors];
-    PRIntervalTime detectorTimeout = PR_MillisecondsToInterval(20000);
+    PRFileDesc *       s;
+    PRSocketOptionData opt;
+    SECStatus          rv;
     int numDetectorResults;
+    PRPollDesc         pollset[2];
+    PRInt32            filesReady;
+    int                error = 0;
+    int i;
 
-    serverCertAuth.dbHandle = NULL;
-    serverCertAuth.requireDataForIntermediates = PR_FALSE;
-
-    progName = strrchr(argv[0], '/');
-    if (!progName)
-	progName = strrchr(argv[0], '\\');
-    progName = progName ? progName+1 : argv[0];
-
-    tmp = PR_GetEnv("NSS_DEBUG_TIMEOUT");
-    if (tmp && tmp[0]) {
-       int sec = PORT_Atoi(tmp);
-       if (sec > 0) {
-           maxInterval = PR_SecondsToInterval(sec);
-       }
+    for (i = 0; i < numDetectors; ++i) {
+	serverCertAuth.detectorCerts[i] = NULL;
     }
+    serverCertAuth.directCert = NULL;
 
-    SSL_VersionRangeGetSupported(ssl_variant_stream, &enabledVersions);
+    if (allow_direct_probe || oneShotMode) {
+	status = PR_StringToNetAddr(host, &addr);
+	if (status == PR_SUCCESS) {
+	    addr.inet.port = PR_htons(portno);
+	} else {
+	    /* Lookup host */
+	    PRAddrInfo *addrInfo;
+	    void       *enumPtr   = NULL;
 
-    optstate = PL_CreateOptState(argc, argv,
-                                 "TV:Yc:fgh:m:p:qst:uvz");
-    while ((optstatus = PL_GetNextOpt(optstate)) == PL_OPT_OK) {
-	switch (optstate->option) {
-	  case '?':
-	  default : Usage(progName); 			break;
-
-	  case 'I': /* reserved for OCSP multi-stapling */ break;
-
-          case 'T': enableCertStatus = 1;               break;
-
-          case 'V': if (SECU_ParseSSLVersionRangeString(optstate->value,
-                            enabledVersions, enableSSL2,
-                            &enabledVersions, &enableSSL2) != SECSuccess) {
-                        Usage(progName);
-                    }
-                    break;
-
-          case 'Y': PrintCipherUsage(progName); exit(0); break;
-
-          case 'c': cipherString = PORT_Strdup(optstate->value); break;
-
-          case 'g': enableFalseStart = 1; 		break;
-
-          case 'f': clientSpeaksFirst = PR_TRUE;        break;
-
-          case 'h': host = PORT_Strdup(optstate->value);	break;
-
-	  case 'm':
-	    multiplier = atoi(optstate->value);
-	    if (multiplier < 0)
-	    	multiplier = 0;
-	    break;
-
-	  case 'p': portno = (PRUint16)atoi(optstate->value);	break;
-
-	  case 'q': pingServerFirst = PR_TRUE;          break;
-
-	  case 's': disableLocking = 1;                 break;
-          
-          case 't': pingTimeoutSeconds = atoi(optstate->value); break;
-
-	  case 'u': enableSessionTickets = PR_TRUE;	break;
-
-	  case 'v': verbose++;	 			break;
-
-	  case 'z': enableCompression = 1;		break;
+	    addrInfo = PR_GetAddrInfoByName(host, PR_AF_UNSPEC, 
+					    PR_AI_ADDRCONFIG | PR_AI_NOCANONNAME);
+	    if (!addrInfo) {
+		SECU_PrintError(progName, "error looking up host");
+		return 1;
+	    }
+	    do {
+		enumPtr = PR_EnumerateAddrInfo(enumPtr, addrInfo, portno, &addr);
+	    } while (enumPtr != NULL &&
+		     addr.raw.family != PR_AF_INET &&
+		     addr.raw.family != PR_AF_INET6);
+	    PR_FreeAddrInfo(addrInfo);
+	    if (enumPtr == NULL) {
+		SECU_PrintError(progName, "error looking up host address");
+		return 1;
+	    }
 	}
-    }
 
-    PL_DestroyOptState(optstate);
-
-    if (optstatus == PL_OPT_BAD)
-	Usage(progName);
-
-    if (!host || !portno) 
-    	Usage(progName);
-
-    PR_Init( PR_SYSTEM_THREAD, PR_PRIORITY_NORMAL, 1);
-
-    PK11_SetPasswordFunc(SECU_GetModulePassword);
-
-    status = PR_StringToNetAddr(host, &addr);
-    if (status == PR_SUCCESS) {
-	addr.inet.port = PR_htons(portno);
+	printHostNameAndAddr(host, &addr);
     } else {
-	/* Lookup host */
-	PRAddrInfo *addrInfo;
-	void       *enumPtr   = NULL;
-
-	addrInfo = PR_GetAddrInfoByName(host, PR_AF_UNSPEC, 
-					PR_AI_ADDRCONFIG | PR_AI_NOCANONNAME);
-	if (!addrInfo) {
-	    SECU_PrintError(progName, "error looking up host");
-	    return 1;
-	}
-	do {
-	    enumPtr = PR_EnumerateAddrInfo(enumPtr, addrInfo, portno, &addr);
-	} while (enumPtr != NULL &&
-		 addr.raw.family != PR_AF_INET &&
-		 addr.raw.family != PR_AF_INET6);
-	PR_FreeAddrInfo(addrInfo);
-	if (enumPtr == NULL) {
-	    SECU_PrintError(progName, "error looking up host address");
-	    return 1;
-	}
-    }
-
-    printHostNameAndAddr(host, &addr);
-
-    if (pingServerFirst) {
-	int iter = 0;
-	PRErrorCode err;
-        int max_attempts = MAX_WAIT_FOR_SERVER;
-        if (pingTimeoutSeconds >= 0) {
-          /* If caller requested a timeout, let's try just twice. */
-          max_attempts = 2;
-        }
-	do {
-            PRIntervalTime timeoutInterval = PR_INTERVAL_NO_TIMEOUT;
-	    s = PR_OpenTCPSocket(addr.raw.family);
-	    if (s == NULL) {
-		SECU_PrintError(progName, "Failed to create a TCP socket");
-	    }
-	    opt.option             = PR_SockOpt_Nonblocking;
-	    opt.value.non_blocking = PR_FALSE;
-	    prStatus = PR_SetSocketOption(s, &opt);
-	    if (prStatus != PR_SUCCESS) {
-		PR_Close(s);
-		SECU_PrintError(progName, 
-		                "Failed to set blocking socket option");
-		return 1;
-	    }
-            if (pingTimeoutSeconds >= 0) {
-              timeoutInterval = PR_SecondsToInterval(pingTimeoutSeconds);
-            }
-	    prStatus = PR_Connect(s, &addr, timeoutInterval);
-	    if (prStatus == PR_SUCCESS) {
-    		PR_Shutdown(s, PR_SHUTDOWN_BOTH);
-    		PR_Close(s);
-    		PR_Cleanup();
-		return 0;
-	    }
-	    err = PR_GetError();
-	    if ((err != PR_CONNECT_REFUSED_ERROR) && 
-	        (err != PR_CONNECT_RESET_ERROR)) {
-		SECU_PrintError(progName, "TCP Connection failed");
-		return 1;
-	    }
-	    PR_Close(s);
-	    PR_Sleep(PR_MillisecondsToInterval(WAIT_INTERVAL));
-	} while (++iter < max_attempts);
-	SECU_PrintError(progName, 
-                     "Client timed out while waiting for connection to server");
-	return 1;
-    }
-
-    rv = NSS_NoDB_Init(NULL);
-    if (rv != SECSuccess) {
-        SECU_PrintError(progName, "unable to init NSS");
-        return 1;
-    }
-
-    /* set the policy bits true for all the cipher suites. */
-    NSS_SetDomesticPolicy();
-
-    /* all the SSL2 and SSL3 cipher suites are enabled by default. */
-    if (cipherString) {
-        /* disable all the ciphers, then enable the ones we want. */
-        disableAllSSLCiphers();
+	status = PR_StringToNetAddr("127.0.0.1", &addr);
     }
 
     /* Create socket */
@@ -982,22 +992,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    serverCertAuth.dbHandle = CERT_GetDefaultCertDB();
-
-#if 0
-    CERTCertificate *peerCert = NULL;
-    SSL_AuthCertificateHook(fd, myGetCertAuthCertificate, &peerCert);
-    if (peerCert)
-	CERT_DestroyCertificate(peerCert);
-    SSL_RevealCert
-#endif
-
-    detectorPorts[0] = 9160;
-    detectorPorts[1] = 9162;
-    detectorPorts[2] = 9164;
-    detectorPorts[3] = 9166;
-    detectorPorts[4] = 9168;
-
     /* use s as a model socket for the detector connections */
     numDetectorResults = 
 	queryDetectors(s, host, portno, 
@@ -1018,110 +1012,479 @@ int main(int argc, char **argv)
 	FPRINTF(stderr, "we obtained %d detector certificates\n", test);
     }
 
-    SSL_AuthCertificateHook(s, ownAuthCertificate, &serverCertAuth);
-    SSL_SetURL(s, host);
-
-    /* Try to connect to the server */
-    status = PR_Connect(s, &addr, PR_INTERVAL_NO_TIMEOUT);
-    if (status != PR_SUCCESS) {
-	if (PR_GetError() == PR_IN_PROGRESS_ERROR) {
-	    if (verbose)
-		SECU_PrintError(progName, "connect");
-	    milliPause(50 * multiplier);
-	    pollset[SSOCK_FD].in_flags = PR_POLL_WRITE | PR_POLL_EXCEPT;
-	    pollset[SSOCK_FD].out_flags = 0;
-	    pollset[SSOCK_FD].fd = s;
-	    while(1) {
-		FPRINTF(stderr, 
-		        "%s: about to call PR_Poll for connect completion!\n", 
-			progName);
-		filesReady = PR_Poll(pollset, 1, PR_INTERVAL_NO_TIMEOUT);
-		if (filesReady < 0) {
-		    SECU_PrintError(progName, "unable to connect (poll)");
-		    return 1;
-		}
-		FPRINTF(stderr,
-		        "%s: PR_Poll returned 0x%02x for socket out_flags.\n",
-			progName, pollset[SSOCK_FD].out_flags);
-		if (filesReady == 0) {	/* shouldn't happen! */
-		    FPRINTF(stderr, "%s: PR_Poll returned zero!\n", progName);
-		    return 1;
-		}
-		status = PR_GetConnectStatus(pollset);
-		if (status == PR_SUCCESS) {
-		    break;
-		}
-		if (PR_GetError() != PR_IN_PROGRESS_ERROR) {
-		    SECU_PrintError(progName, "unable to connect (poll)");
-		    return 1;
-		}
-		SECU_PrintError(progName, "poll");
+    if (allow_direct_probe || oneShotMode) {
+	SSL_AuthCertificateHook(s, ownAuthCertificate, &serverCertAuth);
+	SSL_SetURL(s, host);
+	/* Try to connect to the server */
+	status = PR_Connect(s, &addr, PR_INTERVAL_NO_TIMEOUT);
+	if (status != PR_SUCCESS) {
+	    if (PR_GetError() == PR_IN_PROGRESS_ERROR) {
+		if (verbose)
+		    SECU_PrintError(progName, "connect");
 		milliPause(50 * multiplier);
+		pollset[SSOCK_FD].in_flags = PR_POLL_WRITE | PR_POLL_EXCEPT;
+		pollset[SSOCK_FD].out_flags = 0;
+		pollset[SSOCK_FD].fd = s;
+		while(1) {
+		    FPRINTF(stderr, 
+			    "%s: about to call PR_Poll for connect completion!\n", 
+			    progName);
+		    filesReady = PR_Poll(pollset, 1, PR_INTERVAL_NO_TIMEOUT);
+		    if (filesReady < 0) {
+			SECU_PrintError(progName, "unable to connect (poll)");
+			return 1;
+		    }
+		    FPRINTF(stderr,
+			    "%s: PR_Poll returned 0x%02x for socket out_flags.\n",
+			    progName, pollset[SSOCK_FD].out_flags);
+		    if (filesReady == 0) {	/* shouldn't happen! */
+			FPRINTF(stderr, "%s: PR_Poll returned zero!\n", progName);
+			return 1;
+		    }
+		    status = PR_GetConnectStatus(pollset);
+		    if (status == PR_SUCCESS) {
+			break;
+		    }
+		    if (PR_GetError() != PR_IN_PROGRESS_ERROR) {
+			SECU_PrintError(progName, "unable to connect (poll)");
+			return 1;
+		    }
+		    SECU_PrintError(progName, "poll");
+		    milliPause(50 * multiplier);
+		}
+	    } else {
+		SECU_PrintError(progName, "unable to connect");
+		return 1;
 	    }
-	} else {
-	    SECU_PrintError(progName, "unable to connect");
-	    return 1;
 	}
-    }
 
-    pollset[SSOCK_FD].fd        = s;
-    pollset[SSOCK_FD].in_flags  = PR_POLL_EXCEPT |
-                                  (clientSpeaksFirst ? 0 : PR_POLL_READ);
+	pollset[SSOCK_FD].fd        = s;
+	pollset[SSOCK_FD].in_flags  = PR_POLL_EXCEPT |
+				      (clientSpeaksFirst ? 0 : PR_POLL_READ);
 
-    while (pollset[SSOCK_FD].in_flags) {
-	char buf[1];	/* buffer for stdin */
-	int nb;		/* num bytes read from stdin. */
+	while (pollset[SSOCK_FD].in_flags) {
+	    char buf[1];	/* buffer for stdin */
+	    int nb;		/* num bytes read from stdin. */
 
-	pollset[SSOCK_FD].out_flags = 0;
+	    pollset[SSOCK_FD].out_flags = 0;
 
-	filesReady = PR_Poll(pollset, 1, PR_INTERVAL_NO_TIMEOUT);
-	if (filesReady < 0) {
-	    SECU_PrintError(progName, "select failed");
-	    error = 1;
-	    goto done;
-	}
-	if (filesReady == 0) {	/* shouldn't happen! */
-	    FPRINTF(stderr, "%s: PR_Poll returned zero!\n", progName);
-	    return 1;
-	}
-	if (   (pollset[SSOCK_FD].out_flags & PR_POLL_READ) 
-	    || (pollset[SSOCK_FD].out_flags & PR_POLL_ERR)  
-#ifdef PR_POLL_HUP
-	    || (pollset[SSOCK_FD].out_flags & PR_POLL_HUP)
-#endif
-	    ) {
-	    nb = PR_Recv(pollset[SSOCK_FD].fd, buf, sizeof buf, 0, maxInterval);
-	    if (nb < 0) {
-		PRErrorCode err = PR_GetError();
-		if (err == SEC_ERROR_CERT_VALID) {
+	    filesReady = PR_Poll(pollset, 1, PR_INTERVAL_NO_TIMEOUT);
+	    if (filesReady < 0) {
+		SECU_PrintError(progName, "select failed");
+		error = 1;
+		goto done;
+	    }
+	    if (filesReady == 0) {	/* shouldn't happen! */
+		FPRINTF(stderr, "%s: PR_Poll returned zero!\n", progName);
+		return 1;
+	    }
+	    if (   (pollset[SSOCK_FD].out_flags & PR_POLL_READ) 
+		|| (pollset[SSOCK_FD].out_flags & PR_POLL_ERR)  
+    #ifdef PR_POLL_HUP
+		|| (pollset[SSOCK_FD].out_flags & PR_POLL_HUP)
+    #endif
+		) {
+		nb = PR_Recv(pollset[SSOCK_FD].fd, buf, sizeof buf, 0, maxInterval);
+		if (nb < 0) {
+		    PRErrorCode err = PR_GetError();
+		    if (err == SEC_ERROR_CERT_VALID) {
+			goto done;
+		    } else if (err == SEC_ERROR_CERT_NOT_VALID) {
+			goto done;
+		    } else if (err != PR_WOULD_BLOCK_ERROR) {
+			SECU_PrintError(progName, "read from socket failed");
+			error = 1;
+			goto done;
+		    }
+		} else if (nb == 0) {
+		    /* EOF from socket... stop polling socket for read */
+		    pollset[SSOCK_FD].in_flags = 0;
 		    goto done;
-		} else if (err == SEC_ERROR_CERT_NOT_VALID) {
-		    goto done;
-		} else if (err != PR_WOULD_BLOCK_ERROR) {
-		    SECU_PrintError(progName, "read from socket failed");
-		    error = 1;
+		} else {
 		    goto done;
 		}
-	    } else if (nb == 0) {
-		/* EOF from socket... stop polling socket for read */
-		pollset[SSOCK_FD].in_flags = 0;
-		goto done;
-	    } else {
-		goto done;
 	    }
+	    milliPause(50 * multiplier);
 	}
-	milliPause(50 * multiplier);
     }
 
-  done:
-    PORT_Free(host);
-
+done:
     PR_Close(s);
+    return error;
+}
+
+void
+dumpCertPEM(FILE *out, CERTCertificate *c)
+{
+    char * asciiDER = BTOA_DataToAscii(c->derCert.data, c->derCert.len);
+    if (asciiDER) {
+	fprintf(out, "%s\n%s\n%s\n", 
+	        NS_CERT_HEADER, asciiDER, NS_CERT_TRAILER);
+	PORT_Free(asciiDER);
+    }
+}
+
+void
+writeReport(FILE *out, const char *firstLine, PRBool dumpCerts)
+{
+    int i;
+    if (firstLine) {
+	fputs(firstLine, out);
+	fputs("\n", out);
+    }
+    if (dumpCerts) {
+	for (i = 0; i < numDetectors; ++i) {
+	    if (serverCertAuth.detectorCerts[i]) {
+		fprintf(out, "Certificate found using sphere %d:\n", i+1);
+		SECU_PrintSignedContent(out, &serverCertAuth.detectorCerts[i]->derCert,
+				    0, 1, (SECU_PPFunc)myPrintShortCertID);
+		dumpCertPEM(out, serverCertAuth.detectorCerts[i]);
+		fputs("\n", out);
+	    }
+	}
+	if (serverCertAuth.directCert) {
+	    fprintf(out, "Certificate found using direct connection:\n");
+	    SECU_PrintSignedContent(out, &serverCertAuth.directCert->derCert,
+				0, 1, (SECU_PPFunc)myPrintShortCertID);
+	    dumpCertPEM(out, serverCertAuth.directCert);
+	    fputs("\n", out);
+	}
+    }
+}
+
+typedef struct tempfile_str {
+    char buf[32];
+    FILE *fp;
+} tempfile;
+
+PRBool
+getTempFile(tempfile *tf)
+{
+    int fd;
+    strcpy(tf->buf, "temp-report-XXXXXX");
+    fd = mkstemp(tf->buf);
+    if (fd == -1) {
+	return PR_FALSE;
+    }
+    tf->fp = fdopen(fd, "wb");
+    if (!tf->fp) {
+	close(fd);
+	return PR_FALSE;
+    }
+    return PR_TRUE;
+}
+
+void
+send_alert(const char *report_filename)
+{
+    char *cmd = PR_smprintf("%s %s", alert_script_filename, report_filename);
+    if (!cmd)
+	exit(1);
+    
+    system(cmd);
+    PR_smprintf_free(cmd);
+}
+
+int main(int argc, char **argv)
+{
+    char *             host	=  NULL;
+    char *             tmp;
+    SECStatus          rv;
+    PRUint16           portno = 443;
+    PLOptState *optstate;
+    PLOptStatus optstatus;
+    int error = 0;
+
+    serverCertAuth.dbHandle = NULL;
+    detectorTimeout = PR_MillisecondsToInterval(20000);
+
+    progName = strrchr(argv[0], '/');
+    if (!progName)
+	progName = strrchr(argv[0], '\\');
+    progName = progName ? progName+1 : argv[0];
+
+    tmp = PR_GetEnv("NSS_DEBUG_TIMEOUT");
+    if (tmp && tmp[0]) {
+       int sec = PORT_Atoi(tmp);
+       if (sec > 0) {
+           maxInterval = PR_SecondsToInterval(sec);
+       }
+    }
+
+    SSL_VersionRangeGetSupported(ssl_variant_stream, &enabledVersions);
+
+    optstate = PL_CreateOptState(argc, argv,
+                                 "A:C:D:RTV:WYc:fgh:m:p:suvz");
+    while ((optstatus = PL_GetNextOpt(optstate)) == PL_OPT_OK) {
+	switch (optstate->option) {
+	  case '?':
+	  default : Usage(progName); 			break;
+	  case 'A': alert_script_filename = PORT_Strdup(optstate->value);
+	             configMode = PR_TRUE;
+		     break;
+	  case 'C': config_filename = PORT_Strdup(optstate->value);
+	             configMode = PR_TRUE;
+		     break;
+	  case 'D': dump_filename = PORT_Strdup(optstate->value);
+		     oneShotMode = PR_TRUE;
+		     break;
+          case 'R': allow_direct_probe = PR_FALSE;
+	             configMode = PR_TRUE;
+		     break;
+          case 'G': suppress_all_is_well = PR_TRUE;
+	             configMode = PR_TRUE;
+		     break;
+
+	  case 'I': /* reserved for OCSP multi-stapling */ break;
+
+          case 'T': enableCertStatus = 1;               break;
+
+          case 'V': if (SECU_ParseSSLVersionRangeString(optstate->value,
+                            enabledVersions, enableSSL2,
+                            &enabledVersions, &enableSSL2) != SECSuccess) {
+                        Usage(progName);
+                    }
+                    break;
+
+          case 'Y': PrintCipherUsage(progName); exit(0); break;
+
+          case 'c': cipherString = PORT_Strdup(optstate->value); break;
+
+          case 'g': enableFalseStart = 1; 		break;
+
+          case 'f': clientSpeaksFirst = PR_TRUE;        break;
+
+          case 'h': host = PORT_Strdup(optstate->value);
+		     oneShotMode = PR_TRUE;
+		     break;
+
+	  case 'm':
+	    multiplier = atoi(optstate->value);
+	    if (multiplier < 0)
+	    	multiplier = 0;
+	    break;
+
+	  case 'p': portno = (PRUint16)atoi(optstate->value);
+		     oneShotMode = PR_TRUE;
+		     break;
+
+	  case 's': disableLocking = 1;                 break;
+	  case 'u': enableSessionTickets = PR_TRUE;	break;
+	  case 'v': verbose++;	 			break;
+	  case 'z': enableCompression = 1;		break;
+	}
+    }
+
+    PL_DestroyOptState(optstate);
+
+    if (optstatus == PL_OPT_BAD)
+	Usage(progName);
+
+    if (oneShotMode && (!host || !portno))
+    	Usage(progName);
+    
+    if (configMode && oneShotMode)
+	Usage(progName);
+
+    if (!configMode && !oneShotMode)
+	Usage(progName);
+    
+    if (configMode && !config_filename)
+	Usage(progName);
+
+    PR_Init( PR_SYSTEM_THREAD, PR_PRIORITY_NORMAL, 1);
+
+    /*PK11_SetPasswordFunc(SECU_GetModulePassword);*/
+
+    rv = NSS_NoDB_Init(NULL);
+    if (rv != SECSuccess) {
+        SECU_PrintError(progName, "unable to init NSS");
+        return 1;
+    }
+
+    /* set the policy bits true for all the cipher suites. */
+    NSS_SetDomesticPolicy();
+
+    /* all the SSL2 and SSL3 cipher suites are enabled by default. */
+    if (cipherString) {
+        /* disable all the ciphers, then enable the ones we want. */
+        disableAllSSLCiphers();
+    }
+
+    serverCertAuth.dbHandle = CERT_GetDefaultCertDB();
+
+    detectorPorts[0] = 9160;
+    detectorPorts[1] = 9162;
+    detectorPorts[2] = 9164;
+    detectorPorts[3] = 9166;
+    detectorPorts[4] = 9168;
+
+    if (configMode) {
+	dictionary *d;
+	const char *section, *host, *certfile;
+	int portno;
+	int num_sections, num_certs;
+	int is, ic;
+	char inikey[512];
+
+	d = iniparser_load(config_filename);
+	if (!d)
+	    UsageIni(progName);
+
+	config_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
+
+	num_sections = iniparser_getnsec(d);
+	for (is = 0; is < num_sections; is++) {
+	    int offset = 0;
+	    char *digit_pos;
+	    config_entry *ce;
+	    
+	    section = iniparser_getsecname(d, is);
+	    offset = strlen(section);
+	    if (offset > sizeof(inikey)-20)
+		UsageIni(progName);
+	    strcpy(inikey, section);
+	    strcpy(inikey+offset, ":host");
+	    host = iniparser_getstring(d, inikey, NULL);
+	    strcpy(inikey+offset, ":port");
+	    portno = iniparser_getint(d, inikey, 0);
+	    strcpy(inikey+offset, ":certs");
+	    num_certs = iniparser_getint(d, inikey, 0);
+	    /*following trivial code assumes one digit number of certs*/
+	    if (!host || !portno || num_certs <=0 || num_certs >= 10)
+		UsageIni(progName);
+	    ce = AppendNewConfigEntry(root_config_entry, host, portno);
+	    if (!root_config_entry)
+		root_config_entry = ce;
+	    strcpy(inikey+offset, ":cert");
+	    digit_pos = inikey+offset + strlen(inikey+offset);
+	    *digit_pos = '0';
+	    *(digit_pos+1) = 0;
+	    for (ic = 1; ic <= num_certs; ic++) {
+		++(*digit_pos);
+		certfile = iniparser_getstring(d, inikey, NULL);
+		AppendNewCertEntry(ce->allowed_certs, certfile);
+	    }
+	}
+    }
+
+    if (oneShotMode) {
+	int i;
+	error = probeOne(host, portno);
+	if (dump_filename) {
+	    FILE *fp = fopen(dump_filename, "w");
+	    if (fp) {
+		writeReport(fp, 0, PR_TRUE);
+		fclose(fp);
+	    }
+	}
+	for (i = 0; i < numDetectors; ++i) {
+	    if (serverCertAuth.detectorCerts[i]) {
+		CERT_DestroyCertificate(serverCertAuth.detectorCerts[i]);
+	    }
+	}
+	if (serverCertAuth.directCert) {
+	    CERT_DestroyCertificate(serverCertAuth.directCert);
+	}
+    } else if (configMode) {
+	int i;
+	PRTime last_all_is_well_report = 0;
+	PRBool foundBadCertInCycle = PR_FALSE;
+	PRBool serverMismatched = PR_FALSE;
+	config_entry *entry = root_config_entry;
+	while (entry) {
+	    printf("probing %s:%d\n", entry->host, entry->portno);
+	    serverMismatched = PR_FALSE;
+	    error = probeOne(entry->host, entry->portno);
+
+	    /* iterate (numDetectors+1) times */
+	    for (i = 0; i <= numDetectors; ++i) {
+		CERTCertificate *network_cert = NULL;
+		if (i < numDetectors) {
+		    network_cert = serverCertAuth.detectorCerts[i];
+		} else {
+		    if (allow_direct_probe) {
+			network_cert = serverCertAuth.directCert;
+		    }
+		}
+		if (network_cert) {
+		    CERTCertListNode *node = CERT_LIST_HEAD(entry->allowed_certs);
+		    while ( ! CERT_LIST_END(node, entry->allowed_certs) ) {
+			if (SECITEM_CompareItem(&network_cert->derCert,
+					        &node->cert->derCert) != SECEqual) {
+			    serverMismatched = PR_TRUE;
+			    printf("found mismatching cert in ");
+			    if (i < numDetectors)
+				printf("sphere %d\n", i+1);
+			    else
+				printf("direct connection\n");
+			}
+			node = CERT_LIST_NEXT(node);
+		    }
+		}
+	    }
+	    if (!serverMismatched) {
+		printf("probes matched our expectations\n");
+	    }
+	    if (serverMismatched) {
+		char *header;
+		tempfile tf;
+
+		foundBadCertInCycle = PR_TRUE;
+		if (getTempFile(&tf)) {
+		    /* TODO, better handling for NULL, failure to alert is bad... */
+		    header = PR_smprintf("ALERT - unexpected certificates at %s:%d",
+					 entry->host, entry->portno);
+		    writeReport(tf.fp, header, PR_TRUE);
+		    PR_smprintf_free(header);
+		    fclose(tf.fp);
+		    send_alert(tf.buf);
+		    unlink(tf.buf);
+		}
+	    }
+
+	    entry = entry->next;
+	    if (!entry) {
+		/* we've completed a cycle */
+		if (!foundBadCertInCycle && !suppress_all_is_well) {
+		    /* is it time for the daily all-is-well report? */
+		    const PRUint64 microseconds_per_day = 
+			1000000ULL * 60 * 60 * 24;
+		    PRTime now = PR_Now();
+		    if (now < last_all_is_well_report /* epoch rollover */
+		        || now > (last_all_is_well_report+microseconds_per_day)) {
+			tempfile tf;
+			if (getTempFile(&tf)) {
+			    writeReport(tf.fp, "ALL-IS-WELL", PR_FALSE);
+			    fclose(tf.fp);
+			    send_alert(tf.buf);
+			    unlink(tf.buf);
+			    last_all_is_well_report = now;
+			}
+		    }
+		}
+
+		foundBadCertInCycle = PR_FALSE;
+		entry = root_config_entry;
+		{
+		    unsigned char r;
+		    int sleeptime = 0;
+		    /* let's sleep for a random period between 1 and 18 minutes,
+		     * max(one random byte) * 4 = 1020 seconds = 17 minutes */
+		    PK11_GenerateRandom(&r, 1);
+		    sleeptime = 60 + r*4;
+		    printf("sleeping %d:%02d minutes...\n", sleeptime/60, sleeptime%60);
+		    PR_Sleep(PR_SecondsToInterval(sleeptime));
+		}
+	    }
+	}
+    }
+
     SSL_ClearSessionCache();
     if (NSS_Shutdown() != SECSuccess) {
         exit(1);
     }
-
+    PORT_Free(host);
     FPRINTF(stderr, "detector-probe: exiting with return code %d\n", error);
     PR_Cleanup();
     return error;

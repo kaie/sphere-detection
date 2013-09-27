@@ -4,7 +4,6 @@ if [ `uname -m` = "x86_64" ]; then
 fi
 
 cd nss
-
 if test "$1" = "clean-only"
 then
 	make -s nss_clean_all
@@ -16,4 +15,12 @@ then
 	make -s nss_clean_all
 fi
 make nss_build_all
+cd ..
+
+cd iniparser
+if test "$1" = "clean"
+then
+	make -s clean
+fi
+make
 cd ..

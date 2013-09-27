@@ -44,3 +44,5 @@ include ../nss/cmd/platlibs.mk
 
 #include ../nss/cmd/platrules.mk
 
+CFLAGS += -I../iniparser/src
+EXTRA_LIBS += ../iniparser/libiniparser.so.0

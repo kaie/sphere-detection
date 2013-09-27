@@ -1,6 +1,7 @@
 nspr
 nss
 stem
+iniparser
 tor_data_dir
 dist
 
