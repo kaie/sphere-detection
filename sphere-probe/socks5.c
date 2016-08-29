@@ -33,9 +33,8 @@ static PRLogModuleInfo *gSOCKSLog;
 #define LOGERROR(args)
 #endif
 
+#if 0
 #define LOG(args) PR_LOG(GetProxyLog(), PR_LOG_DEBUG, args)
-
-#define IS_ASCII_SPACE(_c) ((_c) == ' ' || (_c) == '\t')
 
 #if defined(PR_LOGGING)
 static PRLogModuleInfo *
@@ -46,6 +45,7 @@ GetProxyLog()
         sLog = PR_NewLogModule("sslproxy");
     return sLog;
 }
+#endif
 #endif
 
 // Required buffer size for text form of an IP address.

@@ -225,7 +225,6 @@ int multiplier = 0;
 PRBool clientSpeaksFirst = PR_FALSE;
 char *cipherString = NULL;
 SSLVersionRange    enabledVersions;
-PRBool             enableSSL2 = PR_FALSE;
 int                disableLocking = 0;
 int                enableSessionTickets = 0;
 int                enableCompression = 0;
@@ -945,18 +944,6 @@ probeOne(const char *host, PRUint16 portno)
         return 1;
     }
 
-    rv = SSL_OptionSet(s, SSL_ENABLE_SSL2, enableSSL2);
-    if (rv != SECSuccess) {
-       SECU_PrintError(progName, "error enabling SSLv2 ");
-       return 1;
-    }
-
-    rv = SSL_OptionSet(s, SSL_V2_COMPATIBLE_HELLO, enableSSL2);
-    if (rv != SECSuccess) {
-        SECU_PrintError(progName, "error enabling SSLv2 compatible hellos ");
-        return 1;
-    }
-
     /* disable SSL socket locking */
     rv = SSL_OptionSet(s, SSL_NO_LOCKS, disableLocking);
     if (rv != SECSuccess) {
@@ -997,6 +984,7 @@ probeOne(const char *host, PRUint16 portno)
 	queryDetectors(s, host, portno, 
 		       detectorPorts, detectorSockets, 
 		       serverCertAuth.detectorCerts, detectorTimeout);
+    (void)numDetectorResults;
 
     if (verbose)
     {
@@ -1240,8 +1228,8 @@ int main(int argc, char **argv)
           case 'T': enableCertStatus = 1;               break;
 
           case 'V': if (SECU_ParseSSLVersionRangeString(optstate->value,
-                            enabledVersions, enableSSL2,
-                            &enabledVersions, &enableSSL2) != SECSuccess) {
+                            enabledVersions,
+                            &enabledVersions) != SECSuccess) {
                         Usage(progName);
                     }
                     break;
