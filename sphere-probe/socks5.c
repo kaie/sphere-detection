@@ -21,8 +21,8 @@ static PRBool ipv6Supported = PR_TRUE;
 
 // A buffer of 262 bytes should be enough for any request and response
 // in case of SOCKS4 as well as SOCKS5
-static const uint32_t BUFFER_SIZE = 262;
-static const uint32_t MAX_HOSTNAME_LEN = 255;
+const uint32_t BUFFER_SIZE = 262;
+const uint32_t MAX_HOSTNAME_LEN = 255;
 
 #if defined(PR_LOGGING)
 static PRLogModuleInfo *gSOCKSLog;
@@ -55,10 +55,10 @@ GetProxyLog()
 // platform-specific headers.
 #ifdef XP_WIN
 // Windows requires longer buffers for some reason.
-static const int kIPv4CStrBufSize = 22;
+//static const int kIPv4CStrBufSize = 22;
 static const int kIPv6CStrBufSize = 65;
 #else
-static const int kIPv4CStrBufSize = 16;
+//static const int kIPv4CStrBufSize = 16;
 static const int kIPv6CStrBufSize = 46;
 #endif
 
@@ -485,7 +485,7 @@ static PRBool SOCKS5Socket_NetAddrToString(const SOCKS5SocketNetAddr *addr, char
 
 #define NS_ABORT_IF_FALSE(exp, msg) PORT_Assert(exp)
 
-inline void
+void
 SOCKS5SocketInfo_WriteUint8(SOCKS5SocketInfo *obj, uint8_t v)
 {
     NS_ABORT_IF_FALSE(obj->mDataLength + sizeof(v) <= BUFFER_SIZE,
@@ -494,7 +494,7 @@ SOCKS5SocketInfo_WriteUint8(SOCKS5SocketInfo *obj, uint8_t v)
     obj->mDataLength += sizeof(v);
 }
 
-inline void
+void
 SOCKS5SocketInfo_WriteUint16(SOCKS5SocketInfo *obj, uint16_t v)
 {
     NS_ABORT_IF_FALSE(obj->mDataLength + sizeof(v) <= BUFFER_SIZE,
@@ -503,7 +503,7 @@ SOCKS5SocketInfo_WriteUint16(SOCKS5SocketInfo *obj, uint16_t v)
     obj->mDataLength += sizeof(v);
 }
 
-inline void
+void
 SOCKS5SocketInfo_WriteUint32(SOCKS5SocketInfo *obj, uint32_t v)
 {
     NS_ABORT_IF_FALSE(obj->mDataLength + sizeof(v) <= BUFFER_SIZE,
@@ -544,7 +544,7 @@ SOCKS5SocketInfo_WriteString(SOCKS5SocketInfo *obj, const char *str)
     obj->mDataLength += len;
 }
 
-inline uint8_t
+uint8_t
 SOCKS5SocketInfo_ReadUint8(SOCKS5SocketInfo *obj)
 {
     uint8_t rv;
@@ -555,7 +555,7 @@ SOCKS5SocketInfo_ReadUint8(SOCKS5SocketInfo *obj)
     return rv;
 }
 
-inline uint16_t
+uint16_t
 SOCKS5SocketInfo_ReadUint16(SOCKS5SocketInfo *obj)
 {
     uint16_t rv;
@@ -566,7 +566,7 @@ SOCKS5SocketInfo_ReadUint16(SOCKS5SocketInfo *obj)
     return rv;
 }
 
-inline uint32_t
+uint32_t
 SOCKS5SocketInfo_ReadUint32(SOCKS5SocketInfo *obj)
 {
     uint32_t rv;
